@@ -24,7 +24,6 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
 import net.bytebuddy.asm.Advice;
@@ -160,9 +159,10 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static DatadogWrapper enterJobSubmit(
+        @Advice.This final Executor executor,
         @Advice.Argument(value = 0, readOnly = false) Runnable task) {
       final Scope scope = GlobalTracer.get().scopeManager().active();
-      if (DatadogWrapper.shouldWrapTask(task)) {
+      if (DatadogWrapper.shouldWrapTask(executor, task)) {
         task = new RunnableWrapper(task, (TraceScope) scope);
         return (RunnableWrapper) task;
       }
@@ -171,8 +171,10 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exitJobSubmit(
-        @Advice.Enter final DatadogWrapper wrapper, @Advice.Thrown final Throwable throwable) {
-      DatadogWrapper.cleanUpOnMethodExit(wrapper, throwable);
+        @Advice.This final Executor executor,
+        @Advice.Enter final DatadogWrapper wrapper,
+        @Advice.Thrown final Throwable throwable) {
+      DatadogWrapper.cleanUpOnMethodExit(executor, wrapper, throwable);
     }
   }
 
@@ -180,10 +182,11 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static DatadogWrapper enterJobSubmit(
+        @Advice.This final Executor executor,
         @Advice.Argument(value = 0, readOnly = false) Callable<?> task) {
 
       final Scope scope = GlobalTracer.get().scopeManager().active();
-      if (DatadogWrapper.shouldWrapTask(task)) {
+      if (DatadogWrapper.shouldWrapTask(executor, task)) {
         task = new CallableWrapper<>(task, (TraceScope) scope);
         return (CallableWrapper) task;
       }
@@ -192,8 +195,10 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exitJobSubmit(
-        @Advice.Enter final DatadogWrapper wrapper, @Advice.Thrown final Throwable throwable) {
-      DatadogWrapper.cleanUpOnMethodExit(wrapper, throwable);
+        @Advice.This final Executor executor,
+        @Advice.Enter final DatadogWrapper wrapper,
+        @Advice.Thrown final Throwable throwable) {
+      DatadogWrapper.cleanUpOnMethodExit(executor, wrapper, throwable);
     }
   }
 
@@ -201,12 +206,13 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static Collection<?> wrapJob(
+        @Advice.This final Executor executor,
         @Advice.Argument(value = 0, readOnly = false) Collection<? extends Callable<?>> tasks) {
       final Scope scope = GlobalTracer.get().scopeManager().active();
       if (scope instanceof TraceScope
           && ((TraceScope) scope).isAsyncPropagating()
           && tasks != null
-          && DatadogWrapper.isTopLevelCall()) {
+          && DatadogWrapper.isTopLevelCall(executor)) {
         final Collection<Callable<?>> wrappedTasks = new ArrayList<>(tasks.size());
         for (final Callable<?> task : tasks) {
           if (task != null && !(task instanceof CallableWrapper)) {
@@ -221,9 +227,11 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void checkCancel(
-        @Advice.Enter final Collection<?> wrappedJobs, @Advice.Thrown final Throwable throwable) {
+        @Advice.This final Executor executor,
+        @Advice.Enter final Collection<?> wrappedJobs,
+        @Advice.Thrown final Throwable throwable) {
       if (null != wrappedJobs) {
-        DatadogWrapper.resetNestedCalls();
+        DatadogWrapper.resetNestedCalls(executor);
 
         if (null != throwable) {
           for (final Object wrapper : wrappedJobs) {
@@ -261,38 +269,40 @@ public final class ExecutorInstrumentation extends Instrumenter.Default {
      *
      * @return true iff call is not nested
      */
-    public static boolean isTopLevelCall() {
-      return CallDepthThreadLocalMap.incrementCallDepth(ExecutorService.class) <= 0;
+    public static boolean isTopLevelCall(final Executor executor) {
+      final int i = CallDepthThreadLocalMap.incrementCallDepth(executor.getClass());
+      return i <= 0;
     }
 
     /** Reset nested calls to executor. */
-    public static void resetNestedCalls() {
-      CallDepthThreadLocalMap.reset(ExecutorService.class);
+    public static void resetNestedCalls(final Executor executor) {
+      CallDepthThreadLocalMap.reset(executor.getClass());
     }
 
     /**
      * @param task task object
      * @return true iff given task object should be wrapped
      */
-    public static boolean shouldWrapTask(final Object task) {
+    public static boolean shouldWrapTask(final Executor executor, final Object task) {
       final Scope scope = GlobalTracer.get().scopeManager().active();
       return (scope instanceof TraceScope
           && ((TraceScope) scope).isAsyncPropagating()
           && task != null
           && !(task instanceof DatadogWrapper)
-          && isTopLevelCall());
+          && isTopLevelCall(executor));
     }
 
     /**
      * Clean up after job submission method has exited
      *
+     * @param executor the current executor
      * @param wrapper task wrapper
      * @param throwable throwable that may have been thrown
      */
     public static void cleanUpOnMethodExit(
-        final DatadogWrapper wrapper, final Throwable throwable) {
+        final Executor executor, final DatadogWrapper wrapper, final Throwable throwable) {
       if (null != wrapper) {
-        resetNestedCalls();
+        resetNestedCalls(executor);
         if (null != throwable) {
           wrapper.cancel();
         }
